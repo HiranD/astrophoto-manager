@@ -3,8 +3,17 @@ import glob
 import json
 from collections import defaultdict
 from tabulate import tabulate
-from typing import List, Tuple, Dict, Any, Optional, Set
+from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime
+
+try:
+    from astropy.io import fits as astropy_fits
+    ASTROPY_AVAILABLE = True
+except ImportError:
+    ASTROPY_AVAILABLE = False
+    print("Warning: astropy not installed. FITS header reading disabled.")
+
+from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -19,14 +28,28 @@ DEFAULT_ORDER = ["L", "R", "G", "B", "Ha", "OIII", "SII", "ALPT", "ALPT2", "UVIR
 # exposure-time goal after discarding poor frames.
 REJECTION_BUFFER_PCT: float = 15.0
 
-# Path to store flat frame history
-FLAT_HISTORY_FILE: str = os.path.expanduser("~/.astrophotography_flats.json")
+# Flat frame directory paths to scan (camera folders)
+# Add your flat directories here - will be scanned for FITS with IMAGETYP='FLAT'
+FLAT_SCAN_PATHS: List[str] = [
+    # "/path/to/533MM/Flats",
+    # "/path/to/585MM/Flats",
+]
+
+# Base ASTRO folder for automatic date-based folder discovery
+# Will scan subfolders matching "YYYY Month" pattern (e.g., "2025 Sep", "2025 July")
+ASTRO_BASE_PATH: str = "/Users/hirandissanayake/Pictures/ASTRO"
+
+# Year(s) to scan for date-based folders (e.g., ["2025"] or ["2024", "2025"])
+ASTRO_SCAN_YEARS: List[str] = ["2025"]
 
 # Tolerance for flat frame angle matching (±degrees)
 FLAT_ANGLE_TOLERANCE: float = 2.5
 
 # Maximum age for flat frames before warning (days)
 FLAT_MAX_AGE_DAYS: int = 90
+
+# Path to cache flat scan results (configurable)
+FLAT_CACHE_FILE: str = os.path.expanduser("~/.astro_flats_cache.json")
 
 # -----------------------------------------------------------------------------
 # Helper functions
@@ -102,66 +125,403 @@ def detect_filter(path: str) -> Optional[str]:
     return None
 
 
-def load_flat_history() -> Dict[str, Dict[float, str]]:
-    """Load flat frame history from persistent storage.
+def extract_date_from_filename(filename: str) -> Optional[str]:
+    """Extract date from FITS filename in YYYY-MM-DD format.
 
-    Returns dict: {filter: {angle: date_captured}}
-    Filter is the primary key since flats are specific to optical setup, not object.
-    Supports both old format (list of angles) and new format (dict with dates).
-    Supports both integer and decimal angles.
+    Expected format: 2025-09-14_03-06-28_FILTER_ANGLE_EXPOSURE.fits
     """
-    if os.path.exists(FLAT_HISTORY_FILE):
-        try:
-            with open(FLAT_HISTORY_FILE, 'r') as f:
-                data = json.load(f)
-
-                # Convert old format to new format with today's date
-                result = {}
-                today = datetime.now().strftime("%Y-%m-%d")
-
-                for filt, angles in data.items():
-                    if isinstance(angles, list):
-                        # Old format: list of angles -> convert to dict with today's date
-                        result[filt] = {float(angle): today for angle in angles}
-                    elif isinstance(angles, dict):
-                        # New format: already has dates, convert string keys to float
-                        result[filt] = {float(angle): date for angle, date in angles.items()}
-
-                return result
-        except (json.JSONDecodeError, KeyError, ValueError):
-            return {}
-    return {}
+    try:
+        basename = os.path.basename(filename)
+        # First part should be date: 2025-09-14
+        date_part = basename.split("_")[0]
+        # Validate it looks like a date
+        datetime.strptime(date_part, "%Y-%m-%d")
+        return date_part
+    except (IndexError, ValueError):
+        return None
 
 
-def save_flat_history(history: Dict[str, Dict[float, str]]):
-    """Save flat frame history to persistent storage."""
+def extract_setup_from_header(fits_file: str) -> Optional[Tuple[str, str]]:
+    """Extract camera and telescope from FITS header.
+
+    Returns (camera, telescope) tuple or None if headers not found.
+    Uses INSTRUME for camera and TELESCOP for telescope.
+    """
+    if not ASTROPY_AVAILABLE:
+        return None
+
+    try:
+        with astropy_fits.open(fits_file) as hdul:
+            header = hdul[0].header
+            camera = header.get("INSTRUME", "").strip()
+            telescope = header.get("TELESCOP", "").strip()
+
+            if camera and telescope:
+                return (camera, telescope)
+    except Exception:
+        pass
+
+    return None
+
+
+def make_setup_key(camera: str, telescope: str) -> str:
+    """Create a setup key from camera and telescope names."""
+    return f"{camera}|{telescope}"
+
+
+def parse_setup_key(setup_key: str) -> Tuple[str, str]:
+    """Parse a setup key back into camera and telescope."""
+    parts = setup_key.split("|", 1)
+    if len(parts) == 2:
+        return (parts[0], parts[1])
+    return (setup_key, "Unknown")
+
+
+def discover_astro_folders() -> List[str]:
+    """Discover folders in ASTRO_BASE_PATH matching patterns.
+
+    Matches:
+    - "YYYY Month" pattern (e.g., "2025 Sep", "2025 July")
+    - Folders containing "Mosaic" anywhere in name
+
+    Returns list of folder paths to scan for flats.
+    """
+    discovered = []
+
+    if not ASTRO_BASE_PATH or not os.path.exists(ASTRO_BASE_PATH):
+        return discovered
+
+    # Month names to match
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+              "January", "February", "March", "April", "May", "June",
+              "July", "August", "September", "October", "November", "December"]
+
+    for entry in os.listdir(ASTRO_BASE_PATH):
+        entry_path = os.path.join(ASTRO_BASE_PATH, entry)
+        if not os.path.isdir(entry_path):
+            continue
+
+        # Check if folder contains "Mosaic" (case-insensitive)
+        if "mosaic" in entry.lower():
+            discovered.append(entry_path)
+            continue
+
+        # Check if folder matches "YYYY Month" pattern
+        for year in ASTRO_SCAN_YEARS:
+            if entry.startswith(year):
+                for month in months:
+                    if month in entry:
+                        discovered.append(entry_path)
+                        break
+                break
+
+    return discovered
+
+
+def get_all_scan_paths() -> List[str]:
+    """Get all paths to scan for flats (manual + auto-discovered)."""
+    all_paths = list(FLAT_SCAN_PATHS)  # Start with manual paths
+    all_paths.extend(discover_astro_folders())  # Add discovered paths
+    return all_paths
+
+
+# Type alias for flat info: {"date": str, "path": str}
+FlatInfoType = Dict[str, str]
+# Type alias for the cache structure: {setup: {filter: {angle: {"date": ..., "path": ...}}}}
+FlatCacheType = Dict[str, Dict[str, Dict[float, FlatInfoType]]]
+
+
+def load_flat_cache() -> Optional[FlatCacheType]:
+    """Load cached flat scan results from file.
+
+    Returns dict: {setup: {filter: {angle: {"date": ..., "path": ...}}}} or None if cache doesn't exist.
+    """
+    if not os.path.exists(FLAT_CACHE_FILE):
+        return None
+
+    try:
+        with open(FLAT_CACHE_FILE, 'r') as f:
+            data = json.load(f)
+            # Convert string keys back to floats for angles
+            result: FlatCacheType = {}
+            for setup, filters in data.items():
+                result[setup] = {}
+                for filt, angles in filters.items():
+                    result[setup][filt] = {}
+                    for angle, info in angles.items():
+                        # Handle old cache format (string date) vs new format (dict)
+                        if isinstance(info, str):
+                            result[setup][filt][float(angle)] = {"date": info, "path": "Unknown"}
+                        else:
+                            result[setup][filt][float(angle)] = info
+            return result
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return None
+
+
+def save_flat_cache(data: FlatCacheType):
+    """Save flat scan results to cache file."""
     # Convert float keys to strings for JSON serialization
-    data = {filt: {str(angle): date for angle, date in angles.items()}
-           for filt, angles in history.items()}
+    json_data = {}
+    for setup, filters in data.items():
+        json_data[setup] = {}
+        for filt, angles in filters.items():
+            json_data[setup][filt] = {str(angle): info for angle, info in angles.items()}
 
-    with open(FLAT_HISTORY_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    with open(FLAT_CACHE_FILE, 'w') as f:
+        json.dump(json_data, f, indent=2)
 
 
-def find_matching_flat(suggested_angle: float, existing_flats: Dict[float, str]) -> Optional[Tuple[float, str]]:
-    """Find an existing flat within tolerance of the suggested angle.
+def scan_flat_directories(use_cache: bool = True, show_progress: bool = False) -> FlatCacheType:
+    """Scan FLAT_SCAN_PATHS for flat frames efficiently.
+
+    Optimization: Since flats are always in separate folders:
+    1. For each folder, verify FIRST file is IMAGETYP='FLAT'
+    2. Extract camera+telescope setup from header
+    3. Extract angle/date from ALL filenames (no more header reads)
+    4. Cache results for future use
 
     Parameters
     ----------
-    suggested_angle : float
-        The angle we need a flat for
-    existing_flats : dict of {float: str}
-        Available flat frame angles and their capture dates
+    use_cache : bool
+        If True, return cached data if available. If False, force rescan.
+    show_progress : bool
+        If True, show progress bar during scanning.
+
+    Returns dict: {setup: {filter: {angle: date}}}
+    """
+    # Check cache first
+    if use_cache:
+        cached = load_flat_cache()
+        if cached is not None:
+            return cached
+
+    result: FlatCacheType = {}
+
+    # Get all paths to scan (manual + auto-discovered)
+    all_scan_paths = get_all_scan_paths()
+
+    if not all_scan_paths:
+        return result
+
+    if not ASTROPY_AVAILABLE:
+        print("Warning: astropy required for FITS header scanning.")
+        return result
+
+    # Collect all folders to process
+    all_folders: Dict[str, List[str]] = {}
+
+    for scan_path in all_scan_paths:
+        if not os.path.exists(scan_path):
+            continue
+
+        # Find all FITS files recursively
+        fits_files = glob.glob(os.path.join(scan_path, "**", "*.fits"), recursive=True)
+
+        if not fits_files:
+            continue
+
+        # Group files by parent folder
+        for fits_file in fits_files:
+            folder = os.path.dirname(fits_file)
+            if folder not in all_folders:
+                all_folders[folder] = []
+            all_folders[folder].append(fits_file)
+
+    # Create iterator with optional progress bar
+    folder_items = list(all_folders.items())
+    if show_progress and folder_items:
+        folder_iterator = tqdm(folder_items, desc="Scanning folders", unit="folder")
+    else:
+        folder_iterator = folder_items
+
+    # Process each folder
+    for folder, folder_files in folder_iterator:
+        # Verify FIRST file is a FLAT and extract setup (one header read per folder)
+        first_file = folder_files[0]
+        setup_key = None
+        try:
+            with astropy_fits.open(first_file) as hdul:
+                header = hdul[0].header
+                image_type = header.get("IMAGETYP", "").strip().upper()
+
+                if image_type != "FLAT":
+                    # Not a flat folder, skip all files in this folder
+                    continue
+
+                # Extract camera and telescope for setup key
+                camera = header.get("INSTRUME", "").strip()
+                telescope = header.get("TELESCOP", "").strip()
+
+                if camera and telescope:
+                    setup_key = make_setup_key(camera, telescope)
+                else:
+                    # Missing setup info, use folder name as fallback
+                    setup_key = f"Unknown|{os.path.basename(folder)}"
+
+        except Exception:
+            # Can't read header, skip this folder
+            continue
+
+        # Initialize setup in result if needed
+        if setup_key not in result:
+            result[setup_key] = {}
+
+        # Folder verified as flats - extract from ALL filenames (no more header reads)
+        for fits_file in folder_files:
+            filt = detect_filter(fits_file)
+            angle = extract_angle(fits_file)
+
+            if filt is None or angle is None:
+                continue
+
+            # Extract date from filename or use file modification time
+            date_captured = extract_date_from_filename(fits_file)
+            if date_captured is None:
+                mtime = os.path.getmtime(fits_file)
+                date_captured = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+
+            # Store in result[setup][filter][angle]
+            if filt not in result[setup_key]:
+                result[setup_key][filt] = {}
+
+            # Keep the most recent date for each angle
+            existing = result[setup_key][filt].get(angle)
+            if existing is None or date_captured > existing["date"]:
+                result[setup_key][filt][angle] = {"date": date_captured, "path": folder}
+
+    # Save to cache for future use
+    if result:
+        save_flat_cache(result)
+
+    return result
+
+
+def refresh_flat_cache(delete_existing: bool = False) -> FlatCacheType:
+    """Force rescan of flat directories and update cache.
+
+    Use this when you've added new flat frames and want to update the cache.
+
+    Parameters
+    ----------
+    delete_existing : bool
+        If True, delete existing cache file before scanning (hard refresh).
+    """
+    # Delete existing cache if requested
+    if delete_existing and os.path.exists(FLAT_CACHE_FILE):
+        os.remove(FLAT_CACHE_FILE)
+        print(f"Deleted existing cache: {FLAT_CACHE_FILE}")
+
+    # Show paths being scanned
+    discovered = discover_astro_folders()
+
+    print("Scanning flat directories...")
+    if FLAT_SCAN_PATHS:
+        print(f"  Manual paths: {len(FLAT_SCAN_PATHS)}")
+    if discovered:
+        print(f"  Auto-discovered ({ASTRO_SCAN_YEARS}): {len(discovered)} folders")
+        for path in discovered[:5]:  # Show first 5
+            print(f"    - {os.path.basename(path)}")
+        if len(discovered) > 5:
+            print(f"    ... and {len(discovered) - 5} more")
+
+    data = scan_flat_directories(use_cache=False, show_progress=True)
+
+    # Count totals per setup
+    total_angles = 0
+    for setup, filters in data.items():
+        setup_angles = sum(len(angles) for angles in filters.values())
+        total_angles += setup_angles
+        camera, telescope = parse_setup_key(setup)
+        print(f"  {camera} + {telescope}: {setup_angles} flat angles")
+
+    print(f"\nCache refreshed: {total_angles} flat angles across {len(data)} setups")
+    print(f"Cache saved to: {FLAT_CACHE_FILE}")
+
+    return data
+
+
+def get_setup_from_lights(fits_files: List[str]) -> Optional[str]:
+    """Extract camera|telescope setup from light frames.
+
+    Reads header from first file to determine setup.
+    Returns setup key or None if not determinable.
+    """
+    if not fits_files or not ASTROPY_AVAILABLE:
+        return None
+
+    # Try first file
+    setup = extract_setup_from_header(fits_files[0])
+    if setup:
+        return make_setup_key(setup[0], setup[1])
+
+    return None
+
+
+def calculate_flats_needed(angles: List[float]) -> List[int]:
+    """Calculate optimal flat angles based on light frame distribution.
+
+    Logic:
+    - If angle range <= 5°: Return ONE angle (weighted mean, favoring higher counts)
+    - If angle range > 5°: Divide into 5° bins, compute weighted mean for each
+
+    Parameters
+    ----------
+    angles : List[float]
+        List of angles from light frames (may contain duplicates for weighting)
 
     Returns
     -------
-    tuple of (float, str) or None
-        The (angle, date) of closest existing flat within tolerance, or None if no match
+    List[int]
+        List of rounded optimal angles for flat frames
     """
-    for existing_angle, date in existing_flats.items():
-        if abs(existing_angle - suggested_angle) <= FLAT_ANGLE_TOLERANCE:
-            return (existing_angle, date)
-    return None
+    if not angles:
+        return []
+
+    unique_angles = sorted(set(angles))
+    min_angle = min(unique_angles)
+    max_angle = max(unique_angles)
+    angle_range = max_angle - min_angle
+
+    # Count frequency of each angle for weighting
+    angle_counts: Dict[float, int] = {}
+    for angle in angles:
+        angle_counts[angle] = angle_counts.get(angle, 0) + 1
+
+    if angle_range <= 5.0:
+        # Single flat: weighted mean favoring angles with more frames
+        weighted_sum = sum(angle * count for angle, count in angle_counts.items())
+        total_count = sum(angle_counts.values())
+        optimal_angle = round(weighted_sum / total_count)
+        return [optimal_angle]
+    else:
+        # Divide into 5° bins
+        suggested = []
+        bin_size = 5.0
+
+        # Create bins from min to max angle
+        current_bin_start = min_angle
+        while current_bin_start <= max_angle:
+            bin_end = current_bin_start + bin_size
+
+            # Find angles in this bin
+            bin_angles = [a for a in angles if current_bin_start <= a < bin_end]
+
+            if bin_angles:
+                # Compute weighted mean for this bin
+                bin_counts = {}
+                for a in bin_angles:
+                    bin_counts[a] = bin_counts.get(a, 0) + 1
+
+                weighted_sum = sum(a * c for a, c in bin_counts.items())
+                total_count = sum(bin_counts.values())
+                bin_optimal = round(weighted_sum / total_count)
+                suggested.append(bin_optimal)
+
+            current_bin_start = bin_end
+
+        return sorted(list(set(suggested)))
 
 
 def is_flat_old(date_captured: str) -> bool:
@@ -186,308 +546,63 @@ def is_flat_old(date_captured: str) -> bool:
         return True
 
 
-def suggest_flat_angles(angles: List[float], existing_flats: Optional[Dict[float, str]] = None) -> List[int]:
-    """Suggest optimal flat frame angles based on light frame angles.
-    Now considers existing flats to avoid suggesting redundant angles.
+def list_existing_flats():
+    """Display all existing flat frames from scanned directories, organized by setup."""
+    all_flats = scan_flat_directories()
 
-    Parameters
-    ----------
-    angles : List[float]
-        Light frame angles from image data
-    existing_flats : Dict[int, str], optional
-        Existing flat frame angles and their capture dates
-
-    Returns
-    -------
-    List[int]
-        List of rounded integer angles that need new flat frames
-
-    Strategy:
-    1. Find which angles are already covered by existing flats (±2° tolerance)
-    2. For uncovered angles, suggest optimal flat positions
-    3. Prefer existing flat angles when they can cover the data
-    """
-    if not angles:
-        return []
-
-    if existing_flats is None:
-        existing_flats = {}
-
-    unique_angles = sorted(set(angles))
-    min_angle = min(unique_angles)
-    max_angle = max(unique_angles)
-    angle_range = max_angle - min_angle
-
-    # Count frequency of each angle
-    angle_counts = {}
-    for angle in angles:
-        angle_counts[angle] = angle_counts.get(angle, 0) + 1
-
-    # Step 1: Find which angles are already covered by existing flats
-    uncovered_angles = []
-    covered_by_existing = []
-
-    for angle in unique_angles:
-        is_covered = False
-        for flat_angle in existing_flats.keys():
-            if abs(angle - flat_angle) <= FLAT_ANGLE_TOLERANCE:
-                is_covered = True
-                if flat_angle not in covered_by_existing:
-                    covered_by_existing.append(flat_angle)
-                break
-
-        if not is_covered:
-            uncovered_angles.append(angle)
-
-    # If all angles are covered by existing flats, return empty list
-    if not uncovered_angles:
-        return []
-
-    # Step 2: For uncovered angles, suggest optimal positions
-    # If we have existing flats, try to extend coverage efficiently
-    if existing_flats and uncovered_angles:
-        suggested = []
-
-        # Group uncovered angles into clusters
-        clusters = []
-        for angle in uncovered_angles:
-            # Find if this angle belongs to an existing cluster
-            placed = False
-            for cluster in clusters:
-                if any(abs(angle - c) <= FLAT_ANGLE_TOLERANCE * 2 for c in cluster):
-                    cluster.append(angle)
-                    placed = True
-                    break
-
-            if not placed:
-                clusters.append([angle])
-
-        # For each cluster, suggest one flat angle
-        for cluster in clusters:
-            # Use weighted mean of cluster
-            cluster_counts = {a: angle_counts[a] for a in cluster}
-            weighted_sum = sum(angle * count for angle, count in cluster_counts.items())
-            total_count = sum(cluster_counts.values())
-            cluster_mean = weighted_sum / total_count
-            suggested.append(round(cluster_mean))
-
-        return sorted(list(set(suggested)))
-
-    # Step 3: Fallback to original algorithm for uncovered angles only
-    if not uncovered_angles:
-        return []
-
-    uncovered_range = max(uncovered_angles) - min(uncovered_angles)
-    uncovered_counts = {a: angle_counts[a] for a in uncovered_angles}
-
-    # Small range - single flat angle at weighted mean
-    if uncovered_range < 10:
-        weighted_sum = sum(angle * count for angle, count in uncovered_counts.items())
-        total_count = sum(uncovered_counts.values())
-        mean_angle = round(weighted_sum / total_count)
-        return [mean_angle]
-
-    # Medium range - suggest 2-3 angles
-    elif uncovered_range <= 30:
-        if len(uncovered_angles) <= 2:
-            return [round(a) for a in uncovered_angles]
-        else:
-            suggested = []
-            # Include min and max of uncovered range
-            suggested.append(round(min(uncovered_angles)))
-            suggested.append(round(max(uncovered_angles)))
-
-            # Add middle if range is large enough
-            if uncovered_range > 15:
-                median_angle = uncovered_angles[len(uncovered_angles) // 2]
-                suggested.append(round(median_angle))
-
-            return sorted(list(set(suggested)))
-
-    # Large range - suggest key angles based on distribution
-    else:
-        # Group into bins and find peaks
-        bin_size = 10  # 10-degree bins
-        bins = {}
-        for angle, count in uncovered_counts.items():
-            bin_idx = int(angle // bin_size)
-            if bin_idx not in bins:
-                bins[bin_idx] = []
-            bins[bin_idx].extend([angle] * count)
-
-        # Find top bins by frame count
-        sorted_bins = sorted(bins.items(), key=lambda x: len(x[1]), reverse=True)
-
-        suggested = []
-        for bin_idx, bin_angles in sorted_bins[:3]:  # Top 3 bins for uncovered
-            # Use weighted mean of bin
-            mean_bin_angle = sum(bin_angles) / len(bin_angles)
-            suggested.append(round(mean_bin_angle))
-
-        return sorted(list(set(suggested)))
-
-
-def update_flat_history(flats: Dict[str, List[float]], replace: bool = False, date_captured: Optional[str] = None):
-    """Update flat frame history by filter.
-
-    Parameters
-    ----------
-    flats : dict
-        Dictionary of {filter: [angles]} that have been captured (supports decimal angles)
-    replace : bool
-        If True, replace existing angles. If False, add to existing.
-    date_captured : str, optional
-        Date when flats were captured (YYYY-MM-DD). If None, uses today's date.
-    """
-    history = load_flat_history()
-
-    if date_captured is None:
-        date_captured = datetime.now().strftime("%Y-%m-%d")
-
-    for filt, angles in flats.items():
-        if replace:
-            history[filt] = {float(angle): date_captured for angle in angles}
-        else:
-            if filt not in history:
-                history[filt] = {}
-            for angle in angles:
-                history[filt][float(angle)] = date_captured
-
-    save_flat_history(history)
-    print(f"Updated flat history")
-    print(f"Filters updated: {', '.join(flats.keys())}")
-    print(f"Date: {date_captured}")
-
-
-def list_flat_history():
-    """Display all flat frame history with dates and age warnings in table format."""
-    history = load_flat_history()
-
-    if not history:
-        print("No flat frame history found.")
+    if not all_flats:
+        print("No flat frames found in configured directories.")
+        print(f"Configure FLAT_SCAN_PATHS in exposures.py to scan for flats.")
         return
 
-    print("\nFLAT FRAME HISTORY")
+    print("\nEXISTING FLAT FRAMES")
     print("="*60)
 
-    # Build table rows
-    table_rows = []
-    for filt in sorted(history.keys()):
-        for angle in sorted(history[filt].keys()):
-            date = history[filt][angle]
-            age_days = (datetime.now() - datetime.strptime(date, "%Y-%m-%d")).days
+    total_all = 0
+    old_all = 0
 
-            if is_flat_old(date):
-                status = f"⚠ OLD ({age_days}d)"
-            else:
-                status = f"✓ Recent ({age_days}d)"
+    # Display flats organized by setup
+    for setup in sorted(all_flats.keys()):
+        camera, telescope = parse_setup_key(setup)
+        filters = all_flats[setup]
 
-            table_rows.append([filt, f"{angle}°", date, status])
+        print(f"\n{camera} | {telescope}")
+        print("-" * 50)
 
-    if table_rows:
-        print(tabulate(
-            table_rows,
-            headers=["Filter", "Angle", "Date Captured", "Status"],
-            tablefmt="grid"
-        ))
+        # Build table rows for this setup
+        table_rows = []
+        for filt in sorted(filters.keys()):
+            for angle in sorted(filters[filt].keys()):
+                info = filters[filt][angle]
+                date = info["date"]
+                path = info.get("path", "Unknown")
+                # Shorten path for display - show last 2 directory components
+                path_parts = path.split(os.sep)
+                short_path = os.sep.join(path_parts[-2:]) if len(path_parts) >= 2 else path
 
-        # Summary
-        total_flats = len(table_rows)
-        old_flats = sum(1 for row in table_rows if "OLD" in row[3])
+                age_days = (datetime.now() - datetime.strptime(date, "%Y-%m-%d")).days
 
-        print(f"\nSummary: {total_flats} flat frames total, {old_flats} need updating (>{FLAT_MAX_AGE_DAYS} days old)")
+                if is_flat_old(date):
+                    status = f"⚠ OLD ({age_days}d)"
+                    old_all += 1
+                else:
+                    status = f"✓ Recent ({age_days}d)"
 
+                table_rows.append([filt, f"{angle}°", date, short_path, status])
+                total_all += 1
 
-def clear_flat_history(filters: Optional[List[str]] = None):
-    """Clear flat frame history for filters.
+        if table_rows:
+            print(tabulate(
+                table_rows,
+                headers=["Filter", "Angle", "Date", "Location", "Status"],
+                tablefmt="grid"
+            ))
 
-    Parameters
-    ----------
-    filters : list of str, optional
-        Specific filters to clear. If None, clears all filters.
-    """
-    history = load_flat_history()
-
-    if not history:
-        print("No flat history found")
-        return
-
-    if filters is None:
-        # Clear all filters
-        history.clear()
-        print("Cleared all flat history")
-    else:
-        # Clear specific filters
-        cleared = []
-        for filt in filters:
-            if filt in history:
-                del history[filt]
-                cleared.append(filt)
-
-        if cleared:
-            print(f"Cleared flat history for filters: {', '.join(cleared)}")
-        else:
-            print(f"No matching filters found: {', '.join(filters)}")
-
-    save_flat_history(history)
-
-
-def remove_flat_angles(filter_name: str, angles: List[int]):
-    """Remove specific angles from flat frame history.
-
-    Parameters
-    ----------
-    filter_name : str
-        Filter to remove angles from
-    angles : list of int
-        Specific angles to remove
-    """
-    history = load_flat_history()
-
-    if filter_name not in history:
-        print(f"No flat history found for filter {filter_name}")
-        return
-
-    # Remove specified angles
-    original = history[filter_name].copy()
-    for angle in angles:
-        history[filter_name].discard(angle)
-
-    # Remove filter if no angles left
-    if not history[filter_name]:
-        del history[filter_name]
-
-    removed = original - history.get(filter_name, set())
-    if removed:
-        save_flat_history(history)
-        print(f"Removed angles from {filter_name}: {', '.join(f'{a}°' for a in sorted(removed))}")
-        remaining = history.get(filter_name, set())
-        if remaining:
-            print(f"Remaining angles: {', '.join(f'{a}°' for a in sorted(remaining))}")
-        else:
-            print(f"No angles remaining for {filter_name}")
-    else:
-        print(f"No matching angles found to remove")
-
-
-def reset_all_flat_history(confirm: bool = False):
-    """Reset all flat frame history.
-
-    Parameters
-    ----------
-    confirm : bool
-        Must be True to actually reset. Safety mechanism to prevent accidental deletion.
-    """
-    if not confirm:
-        print("WARNING: This will delete ALL flat frame history for ALL objects!")
-        print("To confirm, run: reset_all_flat_history(confirm=True)")
-        return
-
-    if os.path.exists(FLAT_HISTORY_FILE):
-        os.remove(FLAT_HISTORY_FILE)
-        print("All flat frame history has been reset.")
-    else:
-        print("No flat frame history file found.")
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"Total: {total_all} flat angles across {len(all_flats)} setups")
+    if old_all > 0:
+        print(f"Warning: {old_all} flats need updating (>{FLAT_MAX_AGE_DAYS} days old)")
 
 
 # -----------------------------------------------------------------------------
@@ -685,6 +800,37 @@ def calculate_total_exposure(
     print(tabulate(display_rows, headers=headers, tablefmt="grid"))
 
     # ------------------------------------------------------------------
+    # Per-Filter Summary table (only when targets are specified)
+    # ------------------------------------------------------------------
+    if target_minutes_per_filter:
+        summary_rows = []
+        for filt in ordered_filters:
+            captured = current_minutes_per_filter.get(filt, 0.0)
+            target = target_minutes_per_filter.get(filt, 0.0)
+            remaining = max(0.0, target - captured)
+
+            if target > 0:
+                progress = (captured / target) * 100.0
+                progress_str = f"{progress:.1f}%"
+            else:
+                progress_str = "—"
+
+            summary_rows.append([
+                filt,
+                hm_string(captured),
+                hm_string(target) if target > 0 else "—",
+                hm_string(remaining) if target > 0 else "—",
+                progress_str
+            ])
+
+        print("\nPer-Filter Summary:")
+        print(tabulate(
+            summary_rows,
+            headers=["Filter", "Captured", "Target", "Remaining", "Progress"],
+            tablefmt="grid"
+        ))
+
+    # ------------------------------------------------------------------
     # Grand-total table
     # ------------------------------------------------------------------
     grand_display: List[List[Any]] = []
@@ -714,163 +860,185 @@ def calculate_total_exposure(
     if flat_data:
         print(f"\n{'='*60}")
         print(f"FLAT FRAME RECOMMENDATIONS")
+
+        # Detect setup from light frames
+        light_setup = get_setup_from_lights(fits_files)
+        if light_setup:
+            camera, telescope = parse_setup_key(light_setup)
+            print(f"Setup: {camera} | {telescope}")
+        else:
+            print("Setup: Unknown (could not read FITS headers)")
+
         print(f"{'='*60}")
 
-        # Load flat history
-        flat_history = load_flat_history()
+        # Scan flat directories for existing flats
+        all_flats = scan_flat_directories()
 
-        # Update history with current session if user confirms
-        current_flats = {}
+        # Get flats only for matching setup
+        if light_setup and light_setup in all_flats:
+            flat_history = all_flats[light_setup]
+        else:
+            flat_history = {}
+            if light_setup and all_flats:
+                print(f"Note: No flats found for this setup. Available setups:")
+                for setup in all_flats.keys():
+                    c, t = parse_setup_key(setup)
+                    print(f"  - {c} | {t}")
 
         flat_rows = []
         for filt in sorted(flat_data.keys()):
-            # Get existing flats for this filter first
+            # Get existing flats for this filter (from matching setup only)
             existing = flat_history.get(filt, {})
 
             # Get detected angles from image data
             detected_angles = sorted(set(flat_data[filt]))
 
-            # Pass existing flats to suggestion algorithm
-            suggested = suggest_flat_angles(flat_data[filt], existing)
-            current_flats[filt] = set(suggested)
+            # Calculate optimal flat angles needed based on distribution
+            optimal_angles = calculate_flats_needed(flat_data[filt])
 
-            # Determine which angles are covered by existing flats (within tolerance)
-            covered_angles = []
-            new_angles = []
-            old_flats = []
-            recent_flats = []
+            # Determine which optimal angles are already covered by existing flats
+            needed_angles = []
+            old_angles = []
 
-            for suggested_angle in suggested:
-                matching_flat = find_matching_flat(suggested_angle, existing)
-                if matching_flat is not None:
-                    angle, date = matching_flat
-                    covered_angles.append(suggested_angle)
-                    if is_flat_old(date):
-                        old_flats.append((angle, date))
-                    else:
-                        recent_flats.append((angle, date))
+            for opt_angle in optimal_angles:
+                # Check if any existing flat covers this angle (within tolerance)
+                is_covered = False
+                covering_flat = None
+                for existing_angle, info in existing.items():
+                    if abs(opt_angle - existing_angle) <= FLAT_ANGLE_TOLERANCE:
+                        is_covered = True
+                        covering_flat = (existing_angle, info["date"])
+                        break
+
+                if is_covered and covering_flat:
+                    # Check if the covering flat is old
+                    if is_flat_old(covering_flat[1]):
+                        old_angles.append(opt_angle)
                 else:
-                    new_angles.append(suggested_angle)
+                    needed_angles.append(opt_angle)
 
-            # Analyze coverage groups
-            coverage_groups = {}
-            uncovered_angles = []
-
-            if existing and detected_angles:
-                # Group detected angles by which flat covers them
-                for det_angle in detected_angles:
-                    covered_by = None
-                    for flat_angle in existing.keys():
-                        if abs(det_angle - flat_angle) <= FLAT_ANGLE_TOLERANCE:
-                            covered_by = flat_angle
-                            break
-
-                    if covered_by is not None:
-                        if covered_by not in coverage_groups:
-                            coverage_groups[covered_by] = []
-                        coverage_groups[covered_by].append(det_angle)
-                    else:
-                        uncovered_angles.append(det_angle)
-
-            # Format coverage groups display
-            if coverage_groups:
-                group_strs = []
-                for flat_angle in sorted(coverage_groups.keys()):
-                    covered = coverage_groups[flat_angle]
-                    if len(covered) == 1:
-                        range_str = f"{covered[0]:.1f}°"
-                    else:
-                        range_str = f"{min(covered):.1f}°-{max(covered):.1f}°"
-                    group_strs.append(f"{flat_angle:.1f}°→{range_str}")
-
-                if uncovered_angles:
-                    if len(uncovered_angles) == 1:
-                        uncov_str = f"{uncovered_angles[0]:.1f}°"
-                    else:
-                        uncov_str = f"{min(uncovered_angles):.1f}°-{max(uncovered_angles):.1f}°"
-                    group_strs.append(f"?→{uncov_str}")
-
-                coverage_str = "; ".join(group_strs)
-            elif uncovered_angles:
-                if len(uncovered_angles) == 1:
-                    coverage_str = f"?→{uncovered_angles[0]:.1f}°"
-                else:
-                    coverage_str = f"?→{min(uncovered_angles):.1f}°-{max(uncovered_angles):.1f}°"
-            else:
-                coverage_str = "No data"
-
-            # Format detected angles display with range
+            # Format detected angles display
             if detected_angles:
-                min_angle = min(detected_angles)
-                max_angle = max(detected_angles)
+                min_det = min(detected_angles)
+                max_det = max(detected_angles)
                 if len(detected_angles) == 1:
                     detected_str = f"{detected_angles[0]:.1f}°"
                 elif len(detected_angles) <= 3:
                     detected_str = ", ".join(f"{a:.1f}°" for a in detected_angles)
                 else:
-                    detected_str = f"{min_angle:.1f}°-{max_angle:.1f}° ({len(detected_angles)} angles)"
+                    detected_str = f"{min_det:.1f}°-{max_det:.1f}° ({len(detected_angles)} angles)"
             else:
                 detected_str = "None"
 
+            # Format existing flats display
             if existing:
-                # Format existing flats with age indicators
-                existing_display = []
-                for angle in sorted(existing.keys()):
-                    date = existing[angle]
-                    if is_flat_old(date):
-                        existing_display.append(f"{angle}°⚠")
-                    else:
-                        existing_display.append(f"{angle}°")
+                angles = sorted(existing.keys())
+                old_count = sum(1 for angle in angles if is_flat_old(existing[angle]["date"]))
 
-                existing_str = ", ".join(existing_display)
-
-                # Determine status considering age
-                if not new_angles and not old_flats:
-                    status = "✓ Have"
-                elif old_flats and not new_angles:
-                    status = "⚠ Old"
-                elif new_angles:
-                    status = "⚠ Need More"
+                if len(angles) <= 5:
+                    existing_display = []
+                    for angle in angles:
+                        if is_flat_old(existing[angle]["date"]):
+                            existing_display.append(f"{angle}°⚠")
+                        else:
+                            existing_display.append(f"{angle}°")
+                    existing_str = ", ".join(existing_display)
                 else:
-                    status = "⚠ Need More"
-
-                # Show what's still needed
-                needed = []
-                if new_angles:
-                    needed.extend([f"{a}°" for a in new_angles])
-                if old_flats:
-                    needed.extend([f"{a}°(old)" for a, _ in old_flats])
-
-                new_str = ", ".join(needed) if needed else "—"
+                    min_ex = min(angles)
+                    max_ex = max(angles)
+                    if old_count > 0:
+                        existing_str = f"{len(angles)} flats ({min_ex}°-{max_ex}°, {old_count}⚠)"
+                    else:
+                        existing_str = f"{len(angles)} flats ({min_ex}°-{max_ex}°)"
             else:
                 existing_str = "None"
-                status = "✗ Need All"
-                new_str = ", ".join(f"{a}°" for a in suggested) if suggested else "—"
 
-            flat_rows.append([filt, detected_str, existing_str, new_str, status, coverage_str])
+            # Format flats needed display
+            all_needed = []
+            if needed_angles:
+                all_needed.extend([f"{a}°" for a in needed_angles])
+            if old_angles:
+                all_needed.extend([f"{a}°(old)" for a in old_angles])
+
+            flats_needed_str = ", ".join(all_needed) if all_needed else "—"
+
+            # Determine status
+            if not needed_angles and not old_angles:
+                status = "✓ Have"
+            elif old_angles and not needed_angles:
+                status = "⚠ Old"
+            elif not existing:
+                status = "✗ Need All"
+            else:
+                status = "⚠ Need More"
+
+            flat_rows.append([filt, detected_str, existing_str, flats_needed_str, status])
 
         print(tabulate(
             flat_rows,
-            headers=["Filter", "Detected Angles", "Existing Flats", "New Flats Needed", "Status", "Coverage Groups"],
+            headers=["Filter", "Detected Angles", "Existing Flats", "Flats Needed", "Status"],
             tablefmt="grid"
         ))
 
-        # Ask user if they want to update the flat history
-        print(f"\nFlat frame history stored in: {FLAT_HISTORY_FILE}")
-
-        # Provide option to mark flats as completed
-        print("\nTo mark flat frames as captured, run:")
-        print(f"  python3 -c \"from exposures import update_flat_history; update_flat_history({dict(current_flats)})\"")
+        # Show cache info
+        if FLAT_SCAN_PATHS:
+            if os.path.exists(FLAT_CACHE_FILE):
+                cache_mtime = datetime.fromtimestamp(os.path.getmtime(FLAT_CACHE_FILE))
+                print(f"\nUsing cached flat data from: {FLAT_CACHE_FILE}")
+                print(f"Cache last updated: {cache_mtime.strftime('%Y-%m-%d %H:%M')}")
+                print("To refresh: refresh_flat_cache()")
+            else:
+                print(f"\nFlat data scanned fresh (no cache existed)")
+                print(f"Cache saved to: {FLAT_CACHE_FILE}")
+        else:
+            print("\nNote: Configure FLAT_SCAN_PATHS in exposures.py to auto-detect existing flats.")
 
 
 # -----------------------------------------------------------------------------
-# Example Usage
+# HOW TO USE THIS SCRIPT
 # -----------------------------------------------------------------------------
-# if __name__ == "__main__":
-#     pct = {"L": 40, "R": 20, "G": 20, "B": 20}  # percentages
-#     calculate_total_exposure(
-#         "/path/to/data",
-#         total_target_hours=10.0,  # decimal hours
-#         filter_pct=pct,
-#         sort_by="remaining_time",
-#     )
+#
+# STEP 1: Configure paths (edit the variables above)
+# -------------------------------------------------
+#   FLAT_SCAN_PATHS = ["/path/to/camera1/Flats", "/path/to/camera2/Flats"]
+#   ASTRO_BASE_PATH = "/Users/you/Pictures/ASTRO"
+#   ASTRO_SCAN_YEARS = ["2025"]  # or ["2024", "2025"]
+#
+#   Auto-discovers folders matching:
+#     - "YYYY Month" (e.g., "2025 Sep", "2025 July")
+#     - Contains "Mosaic" anywhere in name
+#
+# STEP 2: Scan for existing flats (first time or after adding new flats)
+# -----------------------------------------------------------------------
+#   from exposures import refresh_flat_cache
+#   refresh_flat_cache()                      # normal refresh
+#   refresh_flat_cache(delete_existing=True)  # hard refresh (deletes cache first)
+#
+# STEP 3: View all existing flats (organized by camera+telescope setup)
+# ----------------------------------------------------------------------
+#   from exposures import list_existing_flats
+#   list_existing_flats()
+#
+#   Shows: Filter, Angle, Date, Location (folder path), Status
+#
+# STEP 4: Analyze light frames and get flat recommendations
+# ----------------------------------------------------------
+#   from exposures import calculate_total_exposure
+#
+#   calculate_total_exposure(
+#       "/path/to/your/light/frames",
+#       total_target_hours=10.0,                    # optional: target hours
+#       filter_pct={"L": 40, "Ha": 30, "OIII": 30}, # optional: filter %
+#   )
+#
+#   Output shows:
+#     - Exposure stats per filter
+#     - Remaining time/subs needed
+#     - Flat recommendations (setup-aware: camera + telescope)
+#     - Which flat angles you need to capture
+#
+# REQUIREMENTS
+# ------------
+#   pip install astropy tabulate tqdm
+#
+# -----------------------------------------------------------------------------
