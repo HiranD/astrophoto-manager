@@ -45,6 +45,11 @@ ASTRO_SCAN_YEARS: List[str] = ["2025"]
 # Tolerance for flat frame angle matching (±degrees)
 FLAT_ANGLE_TOLERANCE: float = 2.5
 
+# Sensor symmetry for angle normalization (degrees)
+# 180 for rectangular sensors (181° ≈ 1°)
+# 90 for square sensors (91° ≈ 1°)
+SENSOR_SYMMETRY: int = 180
+
 # Maximum age for flat frames before warning (days)
 FLAT_MAX_AGE_DAYS: int = 90
 
@@ -99,6 +104,43 @@ def hm_string(total_minutes: float) -> str:
     """Return a nicely formatted "H h M m" string from minutes."""
     h, m = minutes_to_hm(total_minutes)
     return f"{h} h {m} m"
+
+
+def normalize_angle(angle: float) -> float:
+    """Normalize angle based on sensor symmetry.
+
+    For rectangular sensors (180° symmetry): 181° → 1°, 270° → 90°
+    For square sensors (90° symmetry): 91° → 1°, 181° → 1°
+
+    This allows flats at 1° to match lights at 181° (rectangular)
+    or lights at 91°, 181°, 271° (square).
+    """
+    return angle % SENSOR_SYMMETRY
+
+
+def angles_match(angle1: float, angle2: float, tolerance: float = None) -> bool:
+    """Check if two angles match within tolerance, considering sensor symmetry.
+
+    Normalizes both angles before comparison to handle wraparound.
+    """
+    if tolerance is None:
+        tolerance = FLAT_ANGLE_TOLERANCE
+
+    norm1 = normalize_angle(angle1)
+    norm2 = normalize_angle(angle2)
+
+    # Direct comparison
+    if abs(norm1 - norm2) <= tolerance:
+        return True
+
+    # Handle wraparound near 0/180 boundary
+    # e.g., norm1=1°, norm2=179° should match if tolerance allows
+    if abs(norm1 - norm2 - SENSOR_SYMMETRY) <= tolerance:
+        return True
+    if abs(norm2 - norm1 - SENSOR_SYMMETRY) <= tolerance:
+        return True
+
+    return False
 
 
 def detect_filter(path: str) -> Optional[str]:
@@ -462,9 +504,12 @@ def get_setup_from_lights(fits_files: List[str]) -> Optional[str]:
 def calculate_flats_needed(angles: List[float]) -> List[int]:
     """Calculate optimal flat angles based on light frame distribution.
 
+    Normalizes angles based on sensor symmetry before processing.
+    For rectangular sensors: 181° → 1°, so lights at 181° need flats at ~1°
+
     Logic:
-    - If angle range <= 5°: Return ONE angle (weighted mean, favoring higher counts)
-    - If angle range > 5°: Divide into 5° bins, compute weighted mean for each
+    - If normalized angle range <= 5°: Return ONE angle (weighted mean)
+    - If range > 5°: Divide into 5° bins, compute weighted mean for each
 
     Parameters
     ----------
@@ -474,19 +519,22 @@ def calculate_flats_needed(angles: List[float]) -> List[int]:
     Returns
     -------
     List[int]
-        List of rounded optimal angles for flat frames
+        List of rounded optimal angles for flat frames (normalized)
     """
     if not angles:
         return []
 
-    unique_angles = sorted(set(angles))
+    # Normalize all angles based on sensor symmetry
+    normalized_angles = [normalize_angle(a) for a in angles]
+
+    unique_angles = sorted(set(normalized_angles))
     min_angle = min(unique_angles)
     max_angle = max(unique_angles)
     angle_range = max_angle - min_angle
 
-    # Count frequency of each angle for weighting
+    # Count frequency of each normalized angle for weighting
     angle_counts: Dict[float, int] = {}
-    for angle in angles:
+    for angle in normalized_angles:
         angle_counts[angle] = angle_counts.get(angle, 0) + 1
 
     if angle_range <= 5.0:
@@ -506,7 +554,7 @@ def calculate_flats_needed(angles: List[float]) -> List[int]:
             bin_end = current_bin_start + bin_size
 
             # Find angles in this bin
-            bin_angles = [a for a in angles if current_bin_start <= a < bin_end]
+            bin_angles = [a for a in normalized_angles if current_bin_start <= a < bin_end]
 
             if bin_angles:
                 # Compute weighted mean for this bin
@@ -910,10 +958,11 @@ def calculate_total_exposure(
 
             for opt_angle in optimal_angles:
                 # Check if any existing flat covers this angle (within tolerance)
+                # Uses angles_match() which normalizes for sensor symmetry
                 is_covered = False
                 covering_flat = None
                 for existing_angle, info in existing.items():
-                    if abs(opt_angle - existing_angle) <= FLAT_ANGLE_TOLERANCE:
+                    if angles_match(opt_angle, existing_angle):
                         is_covered = True
                         covering_flat = (existing_angle, info["date"])
                         break
@@ -925,16 +974,19 @@ def calculate_total_exposure(
                 else:
                     needed_angles.append(opt_angle)
 
-            # Format detected angles display
+            # Format detected angles display (show normalized range)
             if detected_angles:
-                min_det = min(detected_angles)
-                max_det = max(detected_angles)
-                if len(detected_angles) == 1:
-                    detected_str = f"{detected_angles[0]:.1f}°"
-                elif len(detected_angles) <= 3:
-                    detected_str = ", ".join(f"{a:.1f}°" for a in detected_angles)
+                # Normalize angles for display
+                norm_angles = sorted(set(normalize_angle(a) for a in detected_angles))
+                min_norm = min(norm_angles)
+                max_norm = max(norm_angles)
+
+                if len(norm_angles) == 1:
+                    detected_str = f"{norm_angles[0]:.1f}°"
+                elif len(norm_angles) <= 3:
+                    detected_str = ", ".join(f"{a:.1f}°" for a in norm_angles)
                 else:
-                    detected_str = f"{min_det:.1f}°-{max_det:.1f}° ({len(detected_angles)} angles)"
+                    detected_str = f"{min_norm:.1f}°-{max_norm:.1f}° ({len(norm_angles)} angles)"
             else:
                 detected_str = "None"
 
@@ -1006,11 +1058,16 @@ def calculate_total_exposure(
 # HOW TO USE THIS SCRIPT
 # -----------------------------------------------------------------------------
 #
-# STEP 1: Configure paths (edit the variables above)
-# -------------------------------------------------
+# STEP 1: Configure paths and sensor (edit the variables above)
+# --------------------------------------------------------------
 #   FLAT_SCAN_PATHS = ["/path/to/camera1/Flats", "/path/to/camera2/Flats"]
 #   ASTRO_BASE_PATH = "/Users/you/Pictures/ASTRO"
 #   ASTRO_SCAN_YEARS = ["2025"]  # or ["2024", "2025"]
+#   SENSOR_SYMMETRY = 180  # 180 for rectangular, 90 for square sensor
+#
+#   Sensor symmetry enables angle normalization:
+#     - Rectangular (180): 181° matches flats at 1° (180° apart = same orientation)
+#     - Square (90): 91° matches flats at 1° (90° apart = same orientation)
 #
 #   Auto-discovers folders matching:
 #     - "YYYY Month" (e.g., "2025 Sep", "2025 July")
