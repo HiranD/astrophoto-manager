@@ -31,13 +31,13 @@ REJECTION_BUFFER_PCT: float = 15.0
 # Flat frame directory paths to scan (camera folders)
 # Add your flat directories here - will be scanned for FITS with IMAGETYP='FLAT'
 FLAT_SCAN_PATHS: List[str] = [
-    # "/path/to/533MM/Flats",
-    # "/path/to/585MM/Flats",
+    # "/path/to/camera1/Flats",
+    # "/path/to/camera2/Flats",
 ]
 
 # Base ASTRO folder for automatic date-based folder discovery
 # Will scan subfolders matching "YYYY Month" pattern (e.g., "2025 Sep", "2025 July")
-ASTRO_BASE_PATH: str = "/Users/hirandissanayake/Pictures/ASTRO"
+ASTRO_BASE_PATH: str = ""  # e.g., "/Users/you/Pictures/ASTRO"
 
 # Year(s) to scan for date-based folders (e.g., ["2025"] or ["2024", "2025"])
 ASTRO_SCAN_YEARS: List[str] = ["2025"]
@@ -576,9 +576,17 @@ def list_existing_flats():
                 info = filters[filt][angle]
                 date = info["date"]
                 path = info.get("path", "Unknown")
-                # Shorten path for display - show last 2 directory components
-                path_parts = path.split(os.sep)
-                short_path = os.sep.join(path_parts[-2:]) if len(path_parts) >= 2 else path
+                # Format path for display:
+                # 1. If under ASTRO_BASE_PATH, show relative path
+                # 2. Otherwise, replace home dir with ~
+                if ASTRO_BASE_PATH and path.startswith(ASTRO_BASE_PATH):
+                    display_path = path[len(ASTRO_BASE_PATH):].lstrip(os.sep)
+                else:
+                    home = os.path.expanduser("~")
+                    if path.startswith(home):
+                        display_path = "~" + path[len(home):]
+                    else:
+                        display_path = path
 
                 age_days = (datetime.now() - datetime.strptime(date, "%Y-%m-%d")).days
 
@@ -588,7 +596,7 @@ def list_existing_flats():
                 else:
                     status = f"✓ Recent ({age_days}d)"
 
-                table_rows.append([filt, f"{angle}°", date, short_path, status])
+                table_rows.append([filt, f"{angle}°", date, display_path, status])
                 total_all += 1
 
         if table_rows:
