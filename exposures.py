@@ -1026,28 +1026,28 @@ def calculate_total_exposure(
             else:
                 detected_str = "None"
 
-            # Format existing flats display
-            if existing:
-                angles = sorted(existing.keys())
-                old_count = sum(1 for angle in angles if is_flat_old(existing[angle]["date"]))
+            # Format matching flats display (only flats that cover this target's angles)
+            matching_flats = []
+            if existing and optimal_angles:
+                for opt_angle in optimal_angles:
+                    for flat_angle, info in existing.items():
+                        if angles_match(opt_angle, flat_angle, symmetry=symmetry):
+                            is_old = is_flat_old(info["date"])
+                            matching_flats.append((flat_angle, is_old))
+                            break  # Found a match for this optimal angle
 
-                if len(angles) <= 5:
-                    existing_display = []
-                    for angle in angles:
-                        if is_flat_old(existing[angle]["date"]):
-                            existing_display.append(f"{angle}°⚠")
-                        else:
-                            existing_display.append(f"{angle}°")
-                    existing_str = ", ".join(existing_display)
-                else:
-                    min_ex = min(angles)
-                    max_ex = max(angles)
-                    if old_count > 0:
-                        existing_str = f"{len(angles)} flats ({min_ex}°-{max_ex}°, {old_count}⚠)"
+            if matching_flats:
+                # Remove duplicates and sort
+                unique_matches = sorted(set(matching_flats), key=lambda x: x[0])
+                matching_display = []
+                for angle, is_old in unique_matches:
+                    if is_old:
+                        matching_display.append(f"{angle}°⚠")
                     else:
-                        existing_str = f"{len(angles)} flats ({min_ex}°-{max_ex}°)"
+                        matching_display.append(f"{angle}°")
+                matching_str = ", ".join(matching_display)
             else:
-                existing_str = "None"
+                matching_str = "None"
 
             # Format flats needed display
             all_needed = []
@@ -1063,16 +1063,16 @@ def calculate_total_exposure(
                 status = "✓ Have"
             elif old_angles and not needed_angles:
                 status = "⚠ Old"
-            elif not existing:
+            elif not matching_flats:
                 status = "✗ Need All"
             else:
                 status = "⚠ Need More"
 
-            flat_rows.append([filt, detected_str, existing_str, flats_needed_str, status])
+            flat_rows.append([filt, detected_str, matching_str, flats_needed_str, status])
 
         print(tabulate(
             flat_rows,
-            headers=["Filter", "Detected Angles", "Existing Flats", "Flats Needed", "Status"],
+            headers=["Filter", "Detected Angles", "Matching Flats", "Flats Needed", "Status"],
             tablefmt="grid"
         ))
 
